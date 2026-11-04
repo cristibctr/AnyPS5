@@ -6,11 +6,28 @@ import sys
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pad_input
+
+
+def open_without_delete_share(path):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(str(path), 0x80000000, 0x3, None, 3, 0x80, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return kernel, handle
 
 
 class PadInputTests(unittest.TestCase):
@@ -251,6 +268,56 @@ class PadInputTests(unittest.TestCase):
             self.queue(1000, "cross")
         self.assertEqual(self.path.read_text(encoding="utf-8"), original)
         self.assertEqual(list(self.root.iterdir()), [self.path])
+
+    @unittest.skipUnless(os.name == "nt", "Windows file sharing")
+    def test_writers_retry_a_transient_sharing_conflict(self):
+        import pad_timeline
+
+        original_replace = os.replace
+        for writer in ("pulse", "timeline"):
+            with self.subTest(writer=writer):
+                self.path.write_text("1 0 300\n", encoding="utf-8")
+                kernel, handle = open_without_delete_share(self.path)
+                denied = threading.Event()
+
+                def replace_and_signal(source, destination):
+                    try:
+                        return original_replace(source, destination)
+                    except OSError:
+                        denied.set()
+                        raise
+
+                def release():
+                    denied.wait(2)
+                    kernel.CloseHandle(handle)
+
+                thread = threading.Thread(target=release)
+                thread.start()
+                try:
+                    with mock.patch.object(pad_input.os, "replace", side_effect=replace_and_signal):
+                        if writer == "pulse":
+                            self.assertEqual(self.queue(1000, "cross"), [1000, 16384, 300])
+                        else:
+                            pad_timeline.queue_timeline(self.path, "APS5_PAD_TIMELINE 1 2 1\n0 300 16384\n")
+                            self.assertEqual(self.path.read_text(encoding="utf-8"), "APS5_PAD_TIMELINE 1 2 1\n0 300 16384\n")
+                    self.assertTrue(denied.is_set())
+                    self.assertEqual(list(self.root.iterdir()), [self.path])
+                finally:
+                    denied.set()
+                    thread.join()
+
+    @unittest.skipUnless(os.name == "nt", "Windows file sharing")
+    def test_persistent_sharing_conflict_preserves_the_command(self):
+        original = "1 0 300\n"
+        self.path.write_text(original, encoding="utf-8")
+        kernel, handle = open_without_delete_share(self.path)
+        try:
+            with self.assertRaises(PermissionError):
+                self.queue(1000, "cross")
+            self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(self.root.iterdir()), [self.path])
+        finally:
+            kernel.CloseHandle(handle)
 
     def test_missing_parent_directory_reports_error(self):
         missing = self.root / "nonexistent" / "command"

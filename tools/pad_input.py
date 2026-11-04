@@ -89,6 +89,18 @@ def next_sequence(path):
     return sequence
 
 
+def replace_command(source, destination):
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def button_mask(value):
     names = value.split("+")
     if any(name not in BUTTONS for name in names) or ("release" in names and len(names) > 1) or len(set(names)) != len(names):
@@ -149,7 +161,7 @@ def main():
                     os.fchown(output.fileno(), metadata.st_uid, metadata.st_gid)
                 os.fchmod(output.fileno(), stat.S_IMODE(metadata.st_mode))
             output.write(f"{sequence} {mask} {args.hold_ms}{sticks}{touch}\n")
-        os.replace(temporary, args.path)
+        replace_command(temporary, args.path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
